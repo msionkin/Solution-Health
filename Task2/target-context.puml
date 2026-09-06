@@ -18,10 +18,10 @@ System(portal, "Веб-портал", "Существующий интерфей
 System_Boundary(platform, "Интеграционная платформа «Здоровье+» (новые компоненты)") {
     System(gateway, "API Gateway", "НОВОЕ. Единая точка входа: OAuth2/JWT, rate limiting, идемпотентность (Idempotency-Key), версионирование /api/v1, маршрутизация")
     System(idp, "Identity Provider", "НОВОЕ. OAuth 2.0 / OIDC, выпуск и отзыв токенов, MFA, RBAC")
-    System(booking, "Сервис записи (оркестратор Saga)", "НОВОЕ. Оркестрирует «слот → полис → оплата → лаборатория», компенсации, transactional outbox")
+    System(booking, "Сервис записи (оркестратор Saga)", "НОВОЕ. Parallel Saga: оркестрирует «слот → полис → авторизация платежа → лаборатория → списание» асинхронными командами через брокер, ведёт журнал состояния, компенсации, идемпотентность входа, transactional outbox")
     System(policy, "Сервис полисов (ACL + кэш)", "НОВОЕ. Anti-corruption layer над 1С: кэш полисов, Circuit Breaker, очередь команд к 1С")
     System(payments, "Платёжный сервис", "НОВОЕ. Идемпотентные платежи, статусы, приём webhook шлюза, сверка (reconciliation)")
-    System(labresults, "Сервис результатов анализов", "НОВОЕ. ACL над LIS: подписчик событий LIS, нормализация в каноническую модель, дедупликация и версионирование, витрина результатов для пациентов, публикация событий")
+    System(labresults, "Сервис результатов анализов", "НОВОЕ. Единый ACL над LIS: подписчик событий LIS, нормализация в каноническую модель, дедупликация и версионирование, витрина результатов для пациентов, публикация событий, резервирование времени забора биоматериала по командам Saga (SOAP)")
     System(objectstore, "Хранилище документов", "НОВОЕ. S3-совместимое объектное хранилище PDF-отчётов и вложений: шифрование, подписанные ссылки с TTL 5 мин")
     System(broker, "Брокер событий", "НОВОЕ. Apache Kafka: доменные события, at-least-once, retention, DLQ")
     System(observability, "Платформа наблюдаемости", "НОВОЕ. OpenTelemetry: распределённая трассировка, метрики, логи, алерты")
@@ -54,11 +54,13 @@ Rel(gateway, booking, "Создать / отменить запись (синх�
 Rel(gateway, labresults, "Список и детали результатов пациента, ссылка на отчёт (синхронно, проверка владельца)", "REST")
 Rel(gateway, policy, "Проверить / прикрепить полис (синхронно из кэша)", "REST")
 
-' ===== Оркестрация Saga =====
-Rel(booking, schedule, "Резерв слота с TTL, подтверждение, освобождение (синхронно, идемпотентно)", "REST")
-Rel(booking, policy, "Проверить полис (синхронно, таймаут + Circuit Breaker)", "REST")
-Rel(booking, payments, "Инициировать / отменить платёж (синхронно, идемпотентно)", "REST")
-Rel(booking, lis, "Резерв времени забора биоматериала, отмена (синхронно через адаптер)", "SOAP")
+' ===== Оркестрация Saga (Parallel Saga: команды и события через брокер) =====
+Rel(booking, broker, "Команды Saga и компенсации: ReserveSlot / CheckPolicy / AuthorizePayment / ReserveLabSlot / CapturePayment / ReleaseSlot / VoidAuthorization / ReleaseLabSlot (асинхронно, ключ шага saga_id:step)", "Kafka")
+Rel(broker, schedule, "Команды резерва, подтверждения и освобождения слота (асинхронно, идемпотентно, оптимистичная блокировка)", "Kafka")
+Rel(broker, policy, "Команда проверки полиса в рамках Saga (асинхронно)", "Kafka")
+Rel(broker, payments, "Команды авторизации, списания, отмены авторизации и возврата (асинхронно, идемпотентно)", "Kafka")
+Rel(broker, labresults, "Команды резерва, подтверждения и снятия резерва времени забора биоматериала (асинхронно)", "Kafka")
+Rel(broker, booking, "Ответные события участников Saga: SlotReserved, PolicyChecked, PaymentAuthorized, LabSlotReserved, PaymentCaptured (асинхронно)", "Kafka")
 Rel(booking, broker, "BookingConfirmed, BookingCancelled (асинхронно, transactional outbox)", "Kafka")
 
 ' ===== Платежи =====
@@ -76,6 +78,7 @@ Rel(policy, policies1c, "Полная выгрузка реестра полис
 Rel(lis, broker, "LisResultReady: результат верифицирован, thin event с идентификаторами (асинхронно, at-least-once)", "Kafka")
 Rel(broker, labresults, "LisResultReady: доставка события подписчику (асинхронно)", "Kafka")
 Rel(labresults, lis, "Запрос содержания результата и PDF-отчёта по идентификатору (синхронно, таймаут + Circuit Breaker)", "REST")
+Rel(labresults, lis, "Резерв, подтверждение и снятие резерва времени забора биоматериала (синхронно, таймаут 5 с, повторы, DLQ)", "SOAP")
 Rel(labresults, broker, "LabResultPublished: thin event без медицинских данных (асинхронно, transactional outbox)", "Kafka")
 Rel(labresults, objectstore, "Сохранение PDF-отчётов и вложений, выдача подписанных ссылок (синхронно)", "S3 API")
 Rel(mobile, objectstore, "Скачивание PDF-отчёта по короткоживущей подписанной ссылке (синхронно)", "HTTPS")

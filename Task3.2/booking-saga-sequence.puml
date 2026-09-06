@@ -1,0 +1,165 @@
+@startuml booking-saga-success
+title Запись к врачу с оплатой и резервированием сдачи анализов: успешный сценарий (Parallel Saga)
+
+' ===== Стиль: палитра C4 / Structurizr =====
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+skinparam defaultFontColor #1B2A3A
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam TitleFontSize 16
+skinparam TitleFontStyle bold
+skinparam TitleFontColor #1B2A3A
+skinparam ArrowFontSize 11
+skinparam maxMessageSize 240
+
+skinparam sequence {
+  ParticipantBackgroundColor #438DD5
+  ParticipantBorderColor #2E6295
+  ParticipantFontColor #FFFFFF
+  ParticipantFontStyle bold
+  ParticipantPadding 16
+  ActorBackgroundColor #08427B
+  ActorBorderColor #08427B
+  ActorFontColor #1B2A3A
+  ActorFontStyle bold
+  LifeLineBorderColor #A9B7C6
+  LifeLineBackgroundColor #F2F5F9
+  ArrowColor #37474F
+  ArrowFontColor #37474F
+  GroupBackgroundColor #E8EEF7
+  GroupBorderColor #7A91AD
+  GroupFontColor #1B2A3A
+  DividerBackgroundColor #EDF1F6
+  DividerBorderColor #A9B7C6
+  DividerFontColor #1B2A3A
+  DividerFontStyle bold
+}
+
+skinparam note {
+  BackgroundColor #F7F9FC
+  BorderColor #A9B7C6
+  FontColor #46586B
+  FontSize 11
+}
+
+' Синий — новые компоненты платформы, серый — существующие системы, тёмно-серый — внешние
+actor "Пациент" as patient
+participant "Мобильное\nприложение" as app #438DD5
+participant "API Gateway" as gw #438DD5
+participant "Сервис записи\n(Saga-оркестратор)" as saga #438DD5
+queue "Kafka\nкоманды и события Saga" as kafka #438DD5
+participant "Расписание" as schedule #7D8794
+participant "Сервис полисов\n(ACL + кэш)" as policy #438DD5
+participant "Платёжный\nсервис" as pay #438DD5
+participant "Платёжный шлюз" as paygw #4A555F
+participant "Сервис результатов\nанализов (ACL над LIS)" as lab #438DD5
+participant "LIS" as lis #7D8794
+participant "Уведомления" as notif #7D8794
+
+== Приём запроса и старт Saga ==
+
+patient -> app : Выбирает врача, слот, услугу\nи время забора биоматериала
+app -> gw : POST /api/v1/appointments\nAuthorization: Bearer JWT\nIdempotency-Key: 01J8F...
+gw -> saga : POST /appointments\n(проверка JWT, rate limiting, trace-id)
+saga -> saga : Ключ новый: создание записи (PENDING)\nи экземпляра Saga в журнале состояния
+saga --> gw : 202 Accepted {saga_id, appointment_id}
+gw --> app : 202 Accepted
+app --> patient : «Обрабатываем запись…»
+
+note over saga
+  Пациент не удерживается в ожидании цепочки вызовов.
+  Статус каждого шага фиксируется в журнале Saga,
+  поэтому перезапуск оркестратора продолжает процесс
+  с последнего шага, а не начинает заново
+end note
+
+== Шаг 1. Резерв слота врача — компенсируемый ==
+
+saga -> kafka : Команда ReserveSlot {saga_id, step: 1}
+kafka -> schedule : Доставка команды
+schedule -> schedule : Резерв слота с TTL 15 мин,\nоптимистичная блокировка по версии слота
+schedule -> kafka : Событие SlotReserved {reservation_id}
+kafka -> saga : Доставка события
+
+== Шаг 2. Проверка полиса ДМС — повторяемое чтение ==
+
+saga -> kafka : Команда CheckPolicy {saga_id, step: 2}
+kafka -> policy : Доставка команды
+policy -> policy : Ответ из кэша полисов.\nПри промахе — вызов 1С с таймаутом 2 с\nи Circuit Breaker, поэтому 1С не стоит\nна пути пациента и не отказывает на пиках
+policy -> kafka : Событие PolicyChecked\n{какое покрытие ДМС}
+kafka -> saga : Доставка события
+
+== Шаг 3. Авторизация платежа: блокировка средств — компенсируемый ==
+
+saga -> kafka : Команда AuthorizePayment {saga_id, step: 3}
+kafka -> pay : Доставка команды
+pay -> paygw : POST /payments/authorize\nIdempotency-Key: saga_id:3, таймаут 10 с
+paygw --> pay : Средства заблокированы (hold), authorization_id
+pay -> kafka : Событие PaymentAuthorized (transactional outbox)
+kafka -> saga : Доставка события
+
+== Шаг 4. Резерв времени забора биоматериала — компенсируемый ==
+
+saga -> kafka : Команда ReserveLabSlot {saga_id, step: 4}
+kafka -> lab : Доставка команды
+lab -> lis : reserveCollectionSlot (SOAP)\nтаймаут 5 с, до 3 повторов
+lis --> lab : Резерв подтверждён, lab_reservation_id
+lab -> kafka : Событие LabSlotReserved
+kafka -> saga : Доставка события
+
+note over saga, lab
+  Резерв лаборатории намеренно вынесен ДО списания средств:
+  его сбой компенсируется отменой авторизации, а не возвратом денег
+end note
+
+== Шаг 5. Списание средств — точка невозврата ==
+
+saga -> kafka : Команда CapturePayment {saga_id, step: 5}
+kafka -> pay : Доставка команды
+pay -> paygw : POST /payments/capture\nтот же Idempotency-Key, автоповторы запрещены
+paygw --> pay : Средства списаны, payment_id
+pay -> kafka : Событие PaymentCaptured (transactional outbox)
+kafka -> saga : Доставка события
+
+note right of saga
+  Дальше идут только повторяемые
+  идемпотентные шаги: при сбое они
+  повторяются, а не откатываются
+end note
+
+== Шаги 6 и 7. Подтверждение резервов — повторяемые ==
+
+par Подтверждение записи к врачу
+    saga -> kafka : Команда ConfirmSlot {saga_id, step: 6}
+    kafka -> schedule : Доставка команды
+    schedule -> kafka : Событие SlotConfirmed
+    kafka -> saga : Доставка события
+else Подтверждение резерва в лаборатории
+    saga -> kafka : Команда ConfirmLabReservation {saga_id, step: 7}
+    kafka -> lab : Доставка команды
+    lab -> lis : confirmCollectionSlot (SOAP)
+    lab -> kafka : Событие LabReservationConfirmed
+    kafka -> saga : Доставка события
+end
+
+== Завершение Saga и уведомление пациента ==
+
+saga -> saga : Saga COMPLETED, запись CONFIRMED\n(состояние и событие — в одной транзакции)
+saga -> kafka : Событие BookingConfirmed (transactional outbox)
+kafka -> notif : Доставка события
+notif -> app : Push «Запись подтверждена: приём 12 мая 10:30,\nзабор анализов 12 мая 09:45»
+
+app -> gw : GET /api/v1/appointments/{id}\n(опрос статуса, если push не пришёл)
+gw -> saga : Чтение состояния записи
+saga --> gw : 200 OK {status: CONFIRMED}
+gw --> app : 200 OK
+app --> patient : «Запись подтверждена»
+
+note over patient, notif
+  202 Accepted пациент получает за P99 < 1 с,
+  статус CONFIRMED — за P95 <= 5 с
+end note
+
+@enduml
