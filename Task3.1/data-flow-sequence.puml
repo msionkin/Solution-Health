@@ -1,0 +1,143 @@
+@startuml lab-results-sequence
+title Доставка результата анализов: последовательность шагов, таймауты и гарантии
+
+' ===== Стиль: палитра C4 / Structurizr =====
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+skinparam defaultFontColor #1B2A3A
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam TitleFontSize 16
+skinparam TitleFontStyle bold
+skinparam TitleFontColor #1B2A3A
+skinparam ArrowFontSize 11
+
+skinparam sequence {
+  ParticipantBackgroundColor #438DD5
+  ParticipantBorderColor #2E6295
+  ParticipantFontColor #FFFFFF
+  ParticipantFontStyle bold
+  ParticipantPadding 16
+  BoxPadding 12
+  ActorBackgroundColor #08427B
+  ActorBorderColor #08427B
+  ActorFontColor #1B2A3A
+  ActorFontStyle bold
+  LifeLineBorderColor #A9B7C6
+  LifeLineBackgroundColor #F2F5F9
+  ArrowColor #37474F
+  ArrowFontColor #37474F
+  GroupBackgroundColor #E8EEF7
+  GroupBorderColor #7A91AD
+  GroupFontColor #1B2A3A
+  GroupHeaderFontColor #1B2A3A
+  GroupHeaderFontSize 11
+  DividerBackgroundColor #EDF1F6
+  DividerBorderColor #A9B7C6
+  DividerFontColor #1B2A3A
+  DividerFontStyle bold
+}
+
+skinparam note {
+  BackgroundColor #F7F9FC
+  BorderColor #A9B7C6
+  FontColor #46586B
+  FontSize 11
+}
+
+' Синий — новые компоненты платформы, серый — существующие системы
+actor "Пациент" as patient
+participant "Мобильное\nприложение" as app #438DD5
+participant "API Gateway" as gw #438DD5
+participant "LIS" as lis #7D8794
+queue "Kafka\nlis.result.ready.v1" as kin #438DD5
+participant "Сервис результатов\nанализов (ACL)" as svc #438DD5
+database "Витрина\nрезультатов" as db #438DD5
+database "Объектное\nхранилище" as s3 #438DD5
+queue "Kafka\nlab.result.published.v1" as kout #438DD5
+participant "CRM" as crm #7D8794
+participant "Уведомления" as notif #7D8794
+
+== Публикация события о готовности ==
+
+lis -> lis : Результат верифицирован,\nстатус «Выдан»
+lis -> kin : LisResultReady\n{result_id, patient_id, version}\nacks=all, key = patient_id
+note right of kin
+  Thin event: медицинских данных
+  в шине нет. Сообщение хранится
+  до подтверждения обработки
+end note
+kin -> svc : Доставка события подписчику
+
+== Получение и обработка результата ==
+
+svc -> lis : GET /results/{result_id}\nтаймаут 5 с
+alt Ошибка или таймаут
+    svc -> lis : Повтор 1..3, задержка 1 с / 2 с / 4 с + джиттер
+    note right of svc
+      После 3 неудач — Circuit Breaker:
+      commit offset не выполняется,
+      сообщение остаётся в топике
+    end note
+end
+lis --> svc : Содержание результата и PDF-отчёт
+
+svc -> svc : Нормализация в каноническую модель
+svc -> svc : Дедупликация по ключу\nresult_id + version
+alt Ключ уже обработан
+    svc -> svc : Дубль отброшен,\nсобытие не публикуется
+end
+svc -> s3 : Сохранение PDF-отчёта\n(шифрование при хранении)
+svc -> db : Транзакция: upsert результата\n+ запись события в outbox
+note right of db
+  Transactional outbox:
+  событие публикуется тогда и только тогда,
+  когда результат зафиксирован
+end note
+svc -> kout : LabResultPublished (outbox-релей)
+svc -> kin : Фиксация обработки (commit offset)
+
+== Потребители события ==
+
+kout -> crm : LabResultPublished\n{result_id, patient_id, version}
+crm -> svc : GET /internal/lab-results/{result_id}\nзапрос содержания (claim check)
+svc --> crm : Результат в канонической модели
+crm -> crm : Идемпотентный upsert\nпо версии результата
+kout -> notif : LabResultPublished
+note right of notif
+  Уведомлениям и аналитике
+  содержание не нужно:
+  достаточно метаданных события
+end note
+notif -> app : Push «Результаты исследования готовы»\n(без медицинских данных)
+
+note over kout, crm
+  Отставание или недоступность CRM
+  не влияет на пациента: витрина
+  наполняется до публикации события
+end note
+
+== Просмотр результата пациентом ==
+
+patient -> app : Открывает раздел «Анализы»
+app -> gw : GET /api/v1/lab-results?status=ready\nAuthorization: Bearer JWT
+gw -> svc : Чтение витрины,\nпроверка владельца результата
+svc -> db : SELECT по patient_id
+db --> svc : Список результатов
+svc --> gw : Список результатов
+gw --> app : 200 OK, P99 < 1 с
+app -> gw : GET /api/v1/lab-results/{id}/file
+gw -> svc : Запрос ссылки на отчёт
+svc --> gw : Подписанная ссылка, TTL 5 мин
+gw --> app : Ссылка на отчёт
+app -> s3 : Скачивание PDF по подписанной ссылке
+s3 --> app : PDF-отчёт
+app --> patient : Результат доступен\nбез звонка в колл-центр
+
+note over lis, app
+  Целевая задержка «Выдан в LIS -> виден в приложении»:
+  P95 <= 1 мин, P99 <= 5 мин
+end note
+
+@enduml

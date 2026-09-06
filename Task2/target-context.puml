@@ -21,7 +21,8 @@ System_Boundary(platform, "Интеграционная платформа «З�
     System(booking, "Сервис записи (оркестратор Saga)", "НОВОЕ. Оркестрирует «слот → полис → оплата → лаборатория», компенсации, transactional outbox")
     System(policy, "Сервис полисов (ACL + кэш)", "НОВОЕ. Anti-corruption layer над 1С: кэш полисов, Circuit Breaker, очередь команд к 1С")
     System(payments, "Платёжный сервис", "НОВОЕ. Идемпотентные платежи, статусы, приём webhook шлюза, сверка (reconciliation)")
-    System(labresults, "Сервис результатов анализов", "НОВОЕ. Приём результатов из LIS, дедупликация, витрина результатов для пациентов, доставка в CRM")
+    System(labresults, "Сервис результатов анализов", "НОВОЕ. ACL над LIS: подписчик событий LIS, нормализация в каноническую модель, дедупликация и версионирование, витрина результатов для пациентов, публикация событий")
+    System(objectstore, "Хранилище документов", "НОВОЕ. S3-совместимое объектное хранилище PDF-отчётов и вложений: шифрование, подписанные ссылки с TTL 5 мин")
     System(broker, "Брокер событий", "НОВОЕ. Apache Kafka: доменные события, at-least-once, retention, DLQ")
     System(observability, "Платформа наблюдаемости", "НОВОЕ. OpenTelemetry: распределённая трассировка, метрики, логи, алерты")
 }
@@ -29,7 +30,7 @@ System_Boundary(platform, "Интеграционная платформа «З�
 ' ===== Существующие системы =====
 System(schedule, "Расписание", "Существующая. Java, REST, PostgreSQL. Добавляются: реплика чтения, резерв слота с TTL, поддержка Idempotency-Key")
 System(crm, "CRM", "Существующая. Java, REST, PostgreSQL. Карточки пациентов, история обращений, результаты анализов")
-System(lis, "LIS (Лабораторная)", "Существующая. SOAP, FTP с анализаторов, REST API для интеграции")
+System(lis, "LIS (Лабораторная)", "Существующая. SOAP, FTP с анализаторов, REST API для интеграции. Публикует событие о готовности результата в брокер")
 System(policies1c, "1С: Полисы", "Существующая. 1С:Предприятие, HTTP-шлюз. Не выдерживает > 50 RPS")
 System(notifications, "Уведомления", "Существующая, модернизируется. RabbitMQ в кластере, DLQ, лимиты очередей")
 
@@ -40,17 +41,17 @@ System_Ext(providers, "Провайдеры Push / SMS / E-mail", "APNs, FCM, SM
 ' ===== Пользователи и каналы =====
 Rel(patient, mobile, "Записывается, оплачивает, смотрит анализы, управляет полисом", "HTTPS")
 Rel(patient, portal, "Использует до полной миграции сценариев в приложение", "HTTPS")
-Rel(doctor, portal, "Управляет расписанием, просматривает анализы", "HTTPS")
+Rel(doctor, portal, "Управляет расписанием, просматривает результаты анализов своих пациентов", "HTTPS")
 Rel(labtech, lis, "Контролирует загрузку результатов (чтение)", "UI / API")
 
 ' ===== Синхронные вызовы через API Gateway =====
 Rel(mobile, gateway, "REST /api/v1: слоты, запись, оплата, анализы, полисы (синхронно, Idempotency-Key)", "HTTPS / JSON, OAuth2 Bearer")
-Rel(portal, gateway, "REST /api/v1 (синхронно), постепенный отказ от прямых вызовов бэкендов", "HTTPS / JSON")
-Rel(gateway, idp, "Проверка JWT по JWKS, интроспекция токена (синхронно, кэш ключей)", "OIDC / HTTPS")
-Rel(mobile, idp, "Аутентификация, обновление токенов (синхронно)", "OAuth2 Authorization Code + PKCE")
+Rel(portal, gateway, "REST /api/v1, в том числе чтение результатов анализов врачом (синхронно), постепенный отказ от прямых вызовов бэкендов", "HTTPS / JSON")
+Rel(gateway, idp, "Проверка JWT (синхронно, кэш ключей)", "OIDC / HTTPS")
+Rel(mobile, idp, "Аутентификация, обновление токенов (синхронно)", "OAuth2")
 Rel(gateway, schedule, "Поиск врачей и свободных слотов (синхронно, реплика чтения, кэш)", "REST")
 Rel(gateway, booking, "Создать / отменить запись (синхронно: 202 Accepted + статус Saga)", "REST")
-Rel(gateway, labresults, "Список и детали результатов пациента (синхронно)", "REST")
+Rel(gateway, labresults, "Список и детали результатов пациента, ссылка на отчёт (синхронно, проверка владельца)", "REST")
 Rel(gateway, policy, "Проверить / прикрепить полис (синхронно из кэша)", "REST")
 
 ' ===== Оркестрация Saga =====
@@ -72,13 +73,18 @@ Rel(policy, policies1c, "Прикрепление полиса, обновлен
 Rel(policy, policies1c, "Полная выгрузка реестра полисов (пакетно, ночью)", "HTTP / файл")
 
 ' ===== Результаты анализов =====
-Rel(lis, labresults, "Результат готов: событие с идентификатором результата (асинхронно, at-least-once)", "REST push / опрос")
-Rel(labresults, broker, "LabResultReady (асинхронно, pub/sub)", "Kafka")
-Rel(broker, crm, "LabResultReady, BookingConfirmed: обновить карточку и историю (асинхронно, идемпотентный upsert)", "Kafka")
+Rel(lis, broker, "LisResultReady: результат верифицирован, thin event с идентификаторами (асинхронно, at-least-once)", "Kafka")
+Rel(broker, labresults, "LisResultReady: доставка события подписчику (асинхронно)", "Kafka")
+Rel(labresults, lis, "Запрос содержания результата и PDF-отчёта по идентификатору (синхронно, таймаут + Circuit Breaker)", "REST")
+Rel(labresults, broker, "LabResultPublished: thin event без медицинских данных (асинхронно, transactional outbox)", "Kafka")
+Rel(labresults, objectstore, "Сохранение PDF-отчётов и вложений, выдача подписанных ссылок (синхронно)", "S3 API")
+Rel(mobile, objectstore, "Скачивание PDF-отчёта по короткоживущей подписанной ссылке (синхронно)", "HTTPS")
+Rel(broker, crm, "LabResultPublished, BookingConfirmed: обновить карточку и историю (асинхронно, идемпотентный upsert)", "Kafka")
+Rel(crm, labresults, "Запрос содержания результата по идентификатору при обработке события, claim check (синхронно)", "REST")
 Rel(broker, labresults, "PaymentCaptured, BookingConfirmed: связать результат с визитом (асинхронно)", "Kafka")
 
 ' ===== Уведомления =====
-Rel(broker, notifications, "BookingConfirmed, PaymentCaptured, LabResultReady, маркетинговые кампании (асинхронно, pub/sub)", "Kafka")
+Rel(broker, notifications, "BookingConfirmed, PaymentCaptured, LabResultPublished, маркетинговые кампании (асинхронно, pub/sub)", "Kafka")
 Rel(notifications, providers, "Отправить push / SMS / e-mail (асинхронно, повторы, DLQ)", "HTTPS")
 Rel(providers, patient, "Push / SMS / e-mail", "асинхронно")
 Rel(providers, mobile, "Push-уведомление о статусе записи, готовности анализов, акциях", "APNs / FCM")

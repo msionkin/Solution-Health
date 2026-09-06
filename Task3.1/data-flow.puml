@@ -1,0 +1,157 @@
+@startuml lab-results-data-flow
+title Поток данных: от готовности результата в LIS до отображения в мобильном приложении «Здоровье+»
+
+' ===== Стиль: палитра C4 / Structurizr =====
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+skinparam defaultFontColor #1B2A3A
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam TitleFontSize 16
+skinparam TitleFontStyle bold
+skinparam TitleFontColor #1B2A3A
+skinparam ArrowFontSize 11
+skinparam ConditionEndStyle hline
+
+skinparam activity {
+  BackgroundColor #E6EEF8
+  BorderColor #438DD5
+  BorderThickness 1
+  FontColor #1B2A3A
+  ArrowColor #37474F
+  ArrowFontColor #37474F
+  DiamondBackgroundColor #FFF4D6
+  DiamondBorderColor #D9A521
+  DiamondFontColor #1B2A3A
+  DiamondFontSize 11
+  StartColor #08427B
+  EndColor #08427B
+  BarColor #7A91AD
+}
+
+skinparam note {
+  BackgroundColor #F7F9FC
+  BorderColor #A9B7C6
+  FontColor #46586B
+  FontSize 11
+}
+
+skinparam swimlane {
+  BorderColor #A9B7C6
+  BorderThickness 1
+  TitleFontColor #1B2A3A
+  TitleFontSize 13
+  TitleFontStyle bold
+}
+
+|#F2F3F5|1. Лаборатория и LIS|
+start
+:Анализатор передаёт измерения в LIS
+(FTP, вне контура интеграции,
+под контролем отсутствия событий от источника);
+:Врач-лаборант верифицирует результат;
+:Статус результата = «Выдан»
+(публикуются только верифицированные результаты);
+:LIS публикует событие LisResultReady:
+идентификаторы результата и пациента, версия;
+note right
+  Thin event: медицинских данных
+  в шине нет. acks=all,
+  ключ — идентификатор пациента
+end note
+
+|#E8EEF7|2. Брокер событий (Kafka)|
+:Топик lis.result.ready.v1,
+репликация 3, at-least-once,
+хранение 7 суток;
+
+|#DCE7F5|3. Сервис результатов анализов (ACL над LIS)|
+:Потребитель читает событие;
+:Запрос содержания результата и PDF-отчёта
+по идентификатору
+(таймаут 5 с, 3 повтора, Circuit Breaker);
+:Нормализация в каноническую модель;
+note right
+  Каноническая модель — единый
+  внутренний формат: пациент,
+  исследование, показатели, единицы,
+  референсы, статус, версия, вложения.
+  Формат LIS знает только этот сервис
+end note
+
+if (Ключ идентификатор + версия уже обработан?) then (да, дубль)
+  :Дубль отброшен, выполняется commit offset,
+  событие не публикуется;
+  stop
+else (нет, новый результат или новая версия)
+endif
+
+if (Формат распознан и пациент сопоставлен?) then (нет)
+  :Сообщение в DLQ или статус
+  «ожидает сопоставления», алерт с trace-id;
+  stop
+else (да)
+endif
+
+:Сохранение PDF-отчёта
+в объектное хранилище;
+:Одна транзакция: запись результата в витрину
++ запись события в outbox;
+note right
+  Transactional outbox устраняет
+  Dual-Write: событие публикуется
+  только при зафиксированном результате
+end note
+:Outbox-релей публикует событие
+LabResultPublished;
+:Commit offset в топике
+lis.result.ready.v1;
+
+|#E8EEF7|4. Брокер событий (Kafka)|
+:Топик lab.result.published.v1,
+at-least-once, DLQ для необработанных сообщений;
+
+|#F2F3F5|5. Независимые потребители события|
+split
+  :CRM: запрос содержания результата
+  по идентификатору у сервиса результатов
+  (claim check), затем идемпотентный
+  upsert по версии;
+  note right
+    Событие переносит только
+    идентификаторы, поэтому содержание
+    потребитель забирает отдельным
+    запросом в объёме своих прав
+  end note
+split again
+  :Уведомления: push «Результаты
+  исследования готовы»
+  (достаточно метаданных события);
+split again
+  :Аналитика: расчёт фактической
+  задержки доставки и SLA
+  (достаточно метаданных события);
+end split
+
+|#DCE7F5|6. Мобильное приложение пациента|
+:Пациент открывает приложение
+(по push или самостоятельно);
+:GET /api/v1/lab-results через API Gateway:
+проверка JWT и владельца результата,
+чтение из витрины (P99 < 1 с);
+:GET /api/v1/lab-results/{id}/file:
+подписанная ссылка на PDF с TTL 5 мин;
+:Пациент видит результат
+и скачивает отчёт;
+note right
+  Врач читает результаты того же
+  пациента через веб-портал: из карточки
+  CRM, а после перевода портала на API
+  Gateway — из той же витрины.
+  Доступ — по активному визиту
+  или направлению, с журналированием
+end note
+stop
+
+@enduml
