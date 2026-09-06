@@ -1,0 +1,97 @@
+@startuml target-context
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+title Целевая контекстная диаграмма (C4 Level 1) ИТ-ландшафта «Здоровье+» после внедрения мобильного приложения
+
+LAYOUT_TOP_DOWN()
+
+' ===== Акторы =====
+Person(patient, "Пациент", "Записывается к врачу, оплачивает услуги, смотрит результаты анализов, управляет полисом ДМС")
+Person(doctor, "Врач", "Управляет расписанием, просматривает анализы пациентов")
+Person(labtech, "Лаборант", "Контролирует загрузку результатов в LIS (только чтение)")
+
+' ===== Каналы =====
+System(mobile, "Мобильное приложение", "НОВОЕ. iOS / Android. Запись, оплата, анализы, полисы, push")
+System(portal, "Веб-портал", "Существующий интерфейс пациентов, врачей и администраторов. Переводится на API Gateway")
+
+' ===== Новый интеграционный слой =====
+System_Boundary(platform, "Интеграционная платформа «Здоровье+» (новые компоненты)") {
+    System(gateway, "API Gateway", "НОВОЕ. Единая точка входа: OAuth2/JWT, rate limiting, идемпотентность (Idempotency-Key), версионирование /api/v1, маршрутизация")
+    System(idp, "Identity Provider", "НОВОЕ. OAuth 2.0 / OIDC, выпуск и отзыв токенов, MFA, RBAC")
+    System(booking, "Сервис записи (оркестратор Saga)", "НОВОЕ. Оркестрирует «слот → полис → оплата → лаборатория», компенсации, transactional outbox")
+    System(policy, "Сервис полисов (ACL + кэш)", "НОВОЕ. Anti-corruption layer над 1С: кэш полисов, Circuit Breaker, очередь команд к 1С")
+    System(payments, "Платёжный сервис", "НОВОЕ. Идемпотентные платежи, статусы, приём webhook шлюза, сверка (reconciliation)")
+    System(labresults, "Сервис результатов анализов", "НОВОЕ. Приём результатов из LIS, дедупликация, витрина результатов для пациентов, доставка в CRM")
+    System(broker, "Брокер событий", "НОВОЕ. Apache Kafka: доменные события, at-least-once, retention, DLQ")
+    System(observability, "Платформа наблюдаемости", "НОВОЕ. OpenTelemetry: распределённая трассировка, метрики, логи, алерты")
+}
+
+' ===== Существующие системы =====
+System(schedule, "Расписание", "Существующая. Java, REST, PostgreSQL. Добавляются: реплика чтения, резерв слота с TTL, поддержка Idempotency-Key")
+System(crm, "CRM", "Существующая. Java, REST, PostgreSQL. Карточки пациентов, история обращений, результаты анализов")
+System(lis, "LIS (Лабораторная)", "Существующая. SOAP, FTP с анализаторов, REST API для интеграции")
+System(policies1c, "1С: Полисы", "Существующая. 1С:Предприятие, HTTP-шлюз. Не выдерживает > 50 RPS")
+System(notifications, "Уведомления", "Существующая, модернизируется. RabbitMQ в кластере, DLQ, лимиты очередей")
+
+' ===== Внешние системы =====
+System_Ext(paygw, "Платёжный шлюз", "Внешний поставщик. Синхронный REST API + webhook о статусе платежа")
+System_Ext(providers, "Провайдеры Push / SMS / E-mail", "APNs, FCM, SMS-шлюз, SMTP")
+
+' ===== Пользователи и каналы =====
+Rel(patient, mobile, "Записывается, оплачивает, смотрит анализы, управляет полисом", "HTTPS")
+Rel(patient, portal, "Использует до полной миграции сценариев в приложение", "HTTPS")
+Rel(doctor, portal, "Управляет расписанием, просматривает анализы", "HTTPS")
+Rel(labtech, lis, "Контролирует загрузку результатов (чтение)", "UI / API")
+
+' ===== Синхронные вызовы через API Gateway =====
+Rel(mobile, gateway, "REST /api/v1: слоты, запись, оплата, анализы, полисы (синхронно, Idempotency-Key)", "HTTPS / JSON, OAuth2 Bearer")
+Rel(portal, gateway, "REST /api/v1 (синхронно), постепенный отказ от прямых вызовов бэкендов", "HTTPS / JSON")
+Rel(gateway, idp, "Проверка JWT по JWKS, интроспекция токена (синхронно, кэш ключей)", "OIDC / HTTPS")
+Rel(mobile, idp, "Аутентификация, обновление токенов (синхронно)", "OAuth2 Authorization Code + PKCE")
+Rel(gateway, schedule, "Поиск врачей и свободных слотов (синхронно, реплика чтения, кэш)", "REST")
+Rel(gateway, booking, "Создать / отменить запись (синхронно: 202 Accepted + статус Saga)", "REST")
+Rel(gateway, labresults, "Список и детали результатов пациента (синхронно)", "REST")
+Rel(gateway, policy, "Проверить / прикрепить полис (синхронно из кэша)", "REST")
+
+' ===== Оркестрация Saga =====
+Rel(booking, schedule, "Резерв слота с TTL, подтверждение, освобождение (синхронно, идемпотентно)", "REST")
+Rel(booking, policy, "Проверить полис (синхронно, таймаут + Circuit Breaker)", "REST")
+Rel(booking, payments, "Инициировать / отменить платёж (синхронно, идемпотентно)", "REST")
+Rel(booking, lis, "Резерв времени забора биоматериала, отмена (синхронно через адаптер)", "SOAP")
+Rel(booking, broker, "BookingConfirmed, BookingCancelled (асинхронно, transactional outbox)", "Kafka")
+
+' ===== Платежи =====
+Rel(payments, paygw, "Провести платёж, запросить статус, возврат (синхронно, таймаут, идемпотентный ключ)", "REST")
+Rel(paygw, payments, "Webhook о финальном статусе платежа (асинхронно, колбэк)", "HTTPS")
+Rel(payments, paygw, "Сверка статусов за период (пакетно, по расписанию)", "REST / реестр")
+Rel(payments, broker, "PaymentCaptured, PaymentFailed, RefundCompleted (асинхронно)", "Kafka")
+
+' ===== Полисы =====
+Rel(policy, policies1c, "Проверка полиса при промахе кэша (синхронно, таймаут, Circuit Breaker, rate limit)", "HTTP")
+Rel(policy, policies1c, "Прикрепление полиса, обновление кэша (асинхронно, очередь команд, повторы)", "HTTP через очередь")
+Rel(policy, policies1c, "Полная выгрузка реестра полисов (пакетно, ночью)", "HTTP / файл")
+
+' ===== Результаты анализов =====
+Rel(lis, labresults, "Результат готов: событие с идентификатором результата (асинхронно, at-least-once)", "REST push / опрос")
+Rel(labresults, broker, "LabResultReady (асинхронно, pub/sub)", "Kafka")
+Rel(broker, crm, "LabResultReady, BookingConfirmed: обновить карточку и историю (асинхронно, идемпотентный upsert)", "Kafka")
+Rel(broker, labresults, "PaymentCaptured, BookingConfirmed: связать результат с визитом (асинхронно)", "Kafka")
+
+' ===== Уведомления =====
+Rel(broker, notifications, "BookingConfirmed, PaymentCaptured, LabResultReady, маркетинговые кампании (асинхронно, pub/sub)", "Kafka")
+Rel(notifications, providers, "Отправить push / SMS / e-mail (асинхронно, повторы, DLQ)", "HTTPS")
+Rel(providers, patient, "Push / SMS / e-mail", "асинхронно")
+Rel(providers, mobile, "Push-уведомление о статусе записи, готовности анализов, акциях", "APNs / FCM")
+
+' ===== Наблюдаемость =====
+Rel(gateway, observability, "Trace, метрики, логи (асинхронно, fire-and-forget)", "OTLP")
+Rel(booking, observability, "Trace, метрики, логи", "OTLP")
+Rel(payments, observability, "Trace, метрики, логи", "OTLP")
+Rel(labresults, observability, "Trace, метрики, логи", "OTLP")
+
+Lay_R(lis, crm)
+Lay_R(mobile, portal)
+Lay_D(gateway, booking)
+
+SHOW_LEGEND()
+@enduml
