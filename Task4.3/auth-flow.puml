@@ -1,0 +1,80 @@
+@startuml auth-flow
+title Аутентификация пациента в мобильном приложении «Здоровье+»
+
+' ===== Стиль: палитра C4 / Structurizr =====
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName Arial
+skinparam defaultFontSize 12
+skinparam defaultFontColor #1B2A3A
+skinparam shadowing false
+skinparam roundCorner 8
+skinparam TitleFontSize 16
+skinparam TitleFontStyle bold
+skinparam TitleFontColor #1B2A3A
+skinparam ArrowFontSize 11
+skinparam maxMessageSize 260
+
+skinparam sequence {
+  ParticipantBackgroundColor #438DD5
+  ParticipantBorderColor #2E6295
+  ParticipantFontColor #FFFFFF
+  ParticipantFontStyle bold
+  ParticipantPadding 16
+  ActorBackgroundColor #08427B
+  ActorBorderColor #08427B
+  ActorFontColor #1B2A3A
+  ActorFontStyle bold
+  LifeLineBorderColor #A9B7C6
+  LifeLineBackgroundColor #F2F5F9
+  ArrowColor #37474F
+  ArrowFontColor #37474F
+  DividerBackgroundColor #EDF1F6
+  DividerBorderColor #A9B7C6
+  DividerFontColor #1B2A3A
+  DividerFontStyle bold
+}
+
+' Синий — новые компоненты платформы
+actor "Пациент" as patient
+participant "Мобильное\nприложение" as app #438DD5
+participant "Identity Provider\n(OAuth 2.0 / OIDC)" as idp #438DD5
+participant "API Gateway" as gw #438DD5
+participant "Бэкенд-сервис" as svc #438DD5
+
+== Получение ключей проверки подписи (фоново, независимо от входа пациента) ==
+
+gw -> idp : GET /.well-known/jwks.json\nпри старте, далее раз в 10 мин
+idp --> gw : Публичные ключи (JWKS) с идентификаторами kid
+gw -> gw : Обновляет локальный кэш ключей.
+
+== Первичный вход: Authorization Code ==
+
+patient -> app : Открывает приложение
+app -> app : Генерирует code_verifier,\ncode_challenge = S256(code_verifier), state
+app -> idp : GET /authorize?response_type=code&client_id=zdorovie-mobile\n&redirect_uri=ru.zdorovie.app://callback\n&code_challenge=...&code_challenge_method=S256\n&scope=openid appointments:rw labresults:read policies:rw&state=...
+idp --> patient : Форма входа: номер телефона и пароль
+patient -> idp : Учётные данные
+idp --> patient : Запрос второго фактора: одноразовый код в SMS
+patient -> idp : Одноразовый код
+idp --> app : 302 ru.zdorovie.app://callback?code=...&state=...\n(код авторизации)
+app -> idp : POST /token\ngrant_type=authorization_code, code, code_verifier, redirect_uri
+idp -> idp : Сверяет S256(code_verifier) с code_challenge
+idp --> app : access_token (JWT RS256, 15 мин),\nrefresh_token (opaque, 30 дней),\nid_token
+app -> app : refresh_token — в Keychain / Android Keystore;\naccess_token — только в памяти процесса
+
+== Вызов защищённого API ==
+
+app -> gw : GET /api/v1/appointments\nAuthorization: Bearer {access_token}
+gw -> gw : Проверка подписи по ключу из локального кэша,\nа также exp, iss, aud, scope.\nОбращения к Identity Provider нет
+gw -> svc : Запрос по mTLS, идентификатор пациента из claim sub
+svc --> gw : 200 OK
+gw --> app : 200 OK
+
+== Обновление истёкшего токена ==
+
+gw --> app : 401 Unauthorized (истёк access_token)
+app -> idp : POST /token\ngrant_type=refresh_token
+idp --> app : Новые access_token и refresh_token (ротация)
+app -> gw : Повтор запроса с новым токеном
+
+@enduml
