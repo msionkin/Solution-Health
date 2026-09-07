@@ -1,0 +1,56 @@
+@startuml policy-load-reduction
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+title Снижение нагрузки на «1С: Полисы»: контекстная диаграмма (C4 Level 1)
+
+LAYOUT_TOP_DOWN()
+
+' ===== Акторы =====
+Person(patient, "Пациент", "Проверяет и прикрепляет полис ДМС, записывается к врачу")
+Person(admin, "Администратор клиники", "Работает с полисами напрямую в 1С")
+
+' ===== Каналы =====
+System(mobile, "Мобильное приложение", "iOS / Android")
+System(portal, "Веб-портал", "Переводится на API Gateway (Strangler Fig)")
+
+' ===== Интеграционная платформа =====
+System_Boundary(platform, "Интеграционная платформа «Здоровье+»") {
+    System(gateway, "API Gateway", "Единая точка входа мобильного приложения и портала")
+    System(booking, "Сервис записи (оркестратор Saga)", "Проверка полиса выполняется шагом Saga")
+    System(policy, "Сервис полисов (ACL + кэш)", "Единственная точка обращения к 1С: read-through кэш, bulkhead 25 одновременных вызовов, Circuit Breaker")
+    SystemDb(cache, "Кэш полисов", "Redis Cluster: статус и покрытие полиса по пациенту")
+    System(broker, "Брокер событий", "Apache Kafka: команды и события Saga")
+}
+
+' ===== Легаси =====
+System(policies1c, "1С: Полисы", "Существующая. 1С:Предприятие, HTTP-шлюз. Потолок 50 RPS, зависания более 30 с")
+
+' ===== Пользовательские каналы =====
+Rel(patient, mobile, "Проверяет и прикрепляет полис, записывается к врачу", "HTTPS")
+Rel(admin, policies1c, "Оформляет и проверяет полисы", "1С / HTTP")
+Rel(mobile, gateway, "Просмотр и прикрепление полиса, создание записи", "HTTPS / JSON")
+Rel(portal, gateway, "Те же API вместо прямых вызовов 1С", "HTTPS / JSON")
+
+' ===== Путь запроса внутри платформы =====
+Rel(gateway, policy, "Проверка полиса (синхронно, ответ из кэша)", "REST")
+Rel(gateway, booking, "Создать запись (синхронно, 202 Accepted)", "REST")
+Rel(booking, broker, "Команда CheckPolicy, событие PolicyChecked (асинхронно)", "Kafka")
+Rel(broker, policy, "Доставка команды CheckPolicy и ответного события (асинхронно)", "Kafka")
+Rel(policy, cache, "Чтение и обновление: подавляющее большинство проверок обслуживается без обращения к 1С", "Redis")
+
+' ===== Контролируемые потоки к 1С =====
+Rel(policy, policies1c, "Промах кэша: проверка полиса (синхронно, таймаут 2 с, 1 повтор, bulkhead, Circuit Breaker, fallback — кэш)", "HTTP")
+Rel(policy, policies1c, "Прикрепление и обновление полиса (асинхронно, очередь команд)", "HTTP через очередь")
+Rel(policy, policies1c, "Выгрузка реестра полисов для прогрева кэша (пакетно, ночью)", "HTTP / файл")
+
+note right of policies1c
+  Кэш снимает подавляющую часть проверок:
+  нагрузка платформы на 1С становится
+  кратно ниже потолка 50 RPS (INT-003)
+end note
+
+Lay_R(mobile, portal)
+Lay_R(policy, cache)
+
+SHOW_LEGEND()
+@enduml
