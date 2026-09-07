@@ -1,0 +1,117 @@
+@startuml target-context
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+title Целевая контекстная диаграмма (C4 Level 1) ИТ-ландшафта «Здоровье+» после внедрения мобильного приложения
+
+LAYOUT_TOP_DOWN()
+
+' Разрядка графа: коридоры между узлами, чтобы подписи стрелок не перекрывались
+skinparam nodesep 45
+skinparam ranksep 75
+skinparam ArrowFontSize 11
+skinparam wrapWidth 220
+
+' ===== Акторы =====
+Person(patient, "Пациент", "Записывается к врачу, оплачивает услуги, смотрит результаты анализов, управляет полисом ДМС")
+Person(doctor, "Врач", "Управляет расписанием, просматривает анализы пациентов")
+Person(labtech, "Лаборант", "Контролирует загрузку результатов в LIS (только чтение)")
+
+' ===== Каналы =====
+System(mobile, "Мобильное приложение", "НОВОЕ. iOS / Android")
+System(portal, "Веб-портал", "Существующий. Переводится на API Gateway (Strangler Fig)")
+
+' ===== Новый интеграционный слой =====
+System_Boundary(platform, "Интеграционная платформа «Здоровье+» (новые компоненты)") {
+    System(gateway, "API Gateway", "OAuth2/JWT, rate limiting, идемпотентность, версия /api/v1")
+    System(idp, "Identity Provider", "OAuth 2.0 / OIDC, MFA, RBAC")
+    System(booking, "Сервис записи (оркестратор Saga)", "Parallel Saga: состояние, компенсации, outbox, модель чтения")
+    System(policy, "Сервис полисов (ACL + кэш)", "ACL над 1С: кэш, Circuit Breaker, очередь команд")
+    System(payments, "Платёжный сервис", "Идемпотентные платежи, приём webhook, сверка")
+    System(labresults, "Сервис результатов анализов", "ACL над LIS: нормализация, дедупликация, витрина, outbox")
+    System(objectstore, "Хранилище документов", "S3-совместимое: PDF-отчёты, подписанные ссылки TTL 5 мин")
+    System(broker, "Брокер событий", "Apache Kafka: at-least-once, retention, DLQ")
+    System(observability, "Платформа наблюдаемости", "OpenTelemetry: трассировка, метрики, логи")
+}
+
+' ===== Существующие системы =====
+System(schedule, "Расписание", "Java, REST, PostgreSQL. Добавляются: реплика чтения, резерв слота с TTL")
+System(crm, "CRM", "Java, REST, PostgreSQL. Карточки пациентов, история обращений")
+System(lis, "LIS (Лабораторная)", "SOAP, FTP с анализаторов. Публикует событие о готовности результата")
+System(policies1c, "1С: Полисы", "1С:Предприятие, HTTP-шлюз. Потолок 50 RPS")
+System(notifications, "Уведомления", "Модернизируется. RabbitMQ в кластере, DLQ, лимиты очередей")
+
+' ===== Внешние системы =====
+System_Ext(paygw, "Платёжный шлюз", "Внешний. Синхронный REST + webhook о статусе платежа")
+System_Ext(providers, "Провайдеры Push / SMS / E-mail", "APNs, FCM, SMS-шлюз, SMTP")
+
+' ===== Пользователи и каналы =====
+Rel(patient, mobile, "Запись, оплата, анализы, полис", "sync · HTTPS")
+Rel(patient, portal, "Сценарии до миграции в приложение", "sync · HTTPS")
+Rel(doctor, portal, "Расписание, результаты пациентов", "sync · HTTPS")
+Rel(labtech, lis, "Контроль загрузки результатов (чтение)", "UI / API")
+
+' ===== Синхронный периметр: приложение и портал через API Gateway =====
+Rel(mobile, gateway, "И-1 Слоты, запись, оплата, анализы, полисы\nIdempotency-Key на изменяющих операциях", "sync · REST / JWT")
+Rel(portal, gateway, "И-17 Те же API вместо прямых вызовов бэкендов", "sync · REST")
+Rel(mobile, idp, "И-2 Вход, обновление токенов", "sync · OAuth 2.0")
+Rel(gateway, idp, "И-3 Проверка JWT по кэшу ключей", "sync · OIDC")
+Rel(gateway, schedule, "И-4 Поиск врачей и свободных слотов", "sync · REST, реплика чтения")
+Rel(gateway, booking, "И-5 Создать / отменить запись (202 Accepted)\nИ-22 Список и карточка записей", "sync · REST")
+Rel(gateway, labresults, "И-15 Результаты пациента, ссылка на отчёт", "sync · REST")
+Rel(gateway, policy, "И-19 Просмотр и прикрепление полиса", "sync · REST")
+
+' ===== Оркестрация Parallel Saga: команды и ответные события через брокер =====
+BiRel(booking, broker, "И-6…И-11 Команды Saga и компенсации ⇄ ответные события участников\nИ-12 BookingConfirmed, BookingCancelled (outbox)", "async · Kafka")
+BiRel(broker, schedule, "И-6 Резерв, подтверждение, освобождение слота ⇄ SlotReserved", "async · Kafka")
+BiRel(broker, policy, "И-7 CheckPolicy ⇄ PolicyChecked", "async · Kafka")
+BiRel(broker, payments, "И-10 Authorize, Capture, Void, Refund ⇄ статусы\nИ-20 PaymentCaptured, PaymentFailed, RefundCompleted (outbox)", "async · Kafka")
+BiRel(broker, labresults, "И-11 Резерв времени забора ⇄ ответ\nИ-13 LisResultReady ▸ И-14 LabResultPublished (outbox)\nИ-21 PaymentCaptured, BookingConfirmed", "async · Kafka")
+
+' ===== Платежи =====
+BiRel(payments, paygw, "И-10 Платёж, статус, возврат ⇄ webhook о финальном статусе\nЕжедневная сверка реестров", "sync · REST / webhook / batch")
+
+' ===== Полисы =====
+Rel(policy, policies1c, "И-7 Проверка при промахе кэша (таймаут, Circuit Breaker)\nИ-8 Прикрепление полиса (очередь команд, DLQ)\nИ-9 Ночная выгрузка реестра", "sync · async · batch")
+
+' ===== Результаты анализов =====
+Rel(lis, broker, "И-13 LisResultReady: thin event с идентификаторами", "async · Kafka")
+Rel(labresults, lis, "И-13 Содержание результата и PDF-отчёт", "sync · REST")
+Rel(labresults, lis, "И-11 Резерв времени забора биоматериала", "sync · SOAP")
+Rel(labresults, objectstore, "И-15 PDF-отчёты, выдача подписанных ссылок", "sync · S3 API")
+Rel(mobile, objectstore, "И-15 Скачивание отчёта по подписанной ссылке", "sync · HTTPS")
+Rel(broker, crm, "И-14 LabResultPublished, BookingConfirmed", "async · Kafka")
+Rel(crm, labresults, "И-14 Содержание результата по идентификатору (claim check)", "sync · REST")
+
+' ===== Уведомления =====
+Rel(broker, notifications, "И-16 BookingConfirmed, PaymentCaptured, LabResultPublished, кампании", "async · Kafka")
+Rel(notifications, providers, "И-16 Отправка сообщения (повторы, DLQ)", "async · HTTPS")
+Rel(providers, mobile, "Push о статусе записи и готовности анализов", "APNs / FCM")
+Rel(providers, patient, "SMS / e-mail", "async")
+
+' ===== Наблюдаемость =====
+Rel(gateway, observability, "И-18 Телеметрия", "async · OTLP")
+
+note right of observability
+  И-18: телеметрию отправляют **все**
+  компоненты платформы (fire-and-forget),
+  сквозная корреляция по trace-id.
+end note
+
+note as legend_notation
+  **Как читать стрелки**
+  **И-N** — номер интеграции в таблице «Здоровье+», target-architecture.md §1:
+  там обоснование выбора паттерна, CAP-профиль и архитектурный стиль.
+  **sync** — синхронный вызов с ожиданием ответа
+  **async** — асинхронная команда или событие через брокер
+  **webhook** — асинхронный колбэк внешней системы
+  **batch** — пакетный обмен по расписанию
+  **⇄** — парный обмен «команда → ответное событие» между теми же участниками
+end note
+
+Lay_R(mobile, portal)
+Lay_R(lis, crm)
+Lay_D(gateway, booking)
+Lay_D(labresults, lis)
+
+SHOW_LEGEND()
+@enduml

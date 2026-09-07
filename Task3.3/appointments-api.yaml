@@ -1,0 +1,193 @@
+openapi: 3.2.0
+info:
+  title: «Здоровье+» Patient API
+  version: 1.0.0
+  description: |
+    API мобильного приложения пациента «Здоровье+».
+    Мажорная версия зафиксирована в пути (/api/v1); версия 1 поддерживается
+    не менее 12 месяцев с даты анонса версии 2.
+servers:
+  - url: https://api.zdorovie-plus.ru/api/v1
+security:
+  - bearerAuth: []
+paths:
+  /appointments:
+    get:
+      summary: Получить список записей пациента
+      description: |
+        Возвращает записи пациента с возможностью пагинации и фильтрации по состоянию записи.
+        Пациент определяется access-токеном, его идентификатор в запросе не передаётся.
+        По умолчанию возвращаются предстоящие записи, отсортированные по времени приёма по возрастанию.
+      parameters:
+        - name: status
+          in: query
+          description: >-
+            Фильтр по состоянию записи: upcoming — предстоящие, past — состоявшиеся,
+            cancelled — отменённые, all — все записи
+          schema:
+            type: string
+            enum: [upcoming, past, cancelled, all]
+            default: upcoming
+        - name: limit
+          in: query
+          description: Количество записей на странице
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: offset
+          in: query
+          description: Смещение для пагинации
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: Список записей пациента
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Appointment'
+                  pagination:
+                    type: object
+                    properties:
+                      total:
+                        type: integer
+                        description: Общее количество записей, удовлетворяющих фильтру
+                      limit:
+                        type: integer
+                        description: Размер страницы
+                      offset:
+                        type: integer
+                        description: Текущее смещение
+                      next:
+                        type: string
+                        nullable: true
+                        description: Ссылка на следующую страницу
+                      prev:
+                        type: string
+                        nullable: true
+                        description: Ссылка на предыдущую страницу
+              example:
+                items:
+                  - id: 01JB6Q7Z8X4M2V9N3T5KWD0PQR
+                    status: confirmed
+                    scheduled_at: '2026-09-12T10:30:00+03:00'
+                    duration_minutes: 30
+                    service_name: Первичная консультация кардиолога
+                    doctor_name: Иванова Мария Сергеевна
+                    specialty: Кардиолог
+                    clinic_name: «Здоровье+» на Тверской
+                    price: 450000
+                    payment_status: paid
+                    lab_reservation_at: null
+                  - id: 01JB6QB4T2C7H8F1S9E3RMA6YZ
+                    status: pending
+                    scheduled_at: '2026-09-18T09:00:00+03:00'
+                    duration_minutes: 20
+                    service_name: Повторный приём терапевта
+                    doctor_name: Петров Алексей Николаевич
+                    specialty: Терапевт
+                    clinic_name: «Здоровье+» на Невском
+                    price: 0
+                    payment_status: authorized
+                    lab_reservation_at: '2026-09-18T08:20:00+03:00'
+                pagination:
+                  total: 2
+                  limit: 20
+                  offset: 0
+                  next: null
+                  prev: null
+        '401':
+          description: >-
+            Запрос не аутентифицирован: токен отсутствует, просрочен или отозван.
+            Приложение обновляет токен по refresh-токену и повторяет запрос
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: AUTH_TOKEN_EXPIRED
+                message: Срок действия access-токена истёк. Обновите токен и повторите запрос
+                trace_id: 01JB7H3Z9QK4M2V8N6T1XW5PDR
+        '500':
+          description: >-
+            Внутренняя ошибка сервера. Подробности не раскрываются; разбор инцидента
+            выполняется по trace_id в платформе наблюдаемости
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                code: INTERNAL_ERROR
+                message: Запрос не выполнен. Повторите попытку позже
+                trace_id: 01JB7H3Z9QK4M2V8N6T1XW5PDR
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        Access-токен JWT, выпущенный Identity Provider «Здоровье+» (OAuth 2.0 / OIDC).
+        Передаётся в заголовке Authorization: Bearer <token> только по TLS.
+        Обязательные claims: sub (идентификатор пациента), scope (appointments:read), exp
+  schemas:
+    Appointment:
+      type: object
+      properties:
+        id:
+          type: string
+          description: Уникальный идентификатор записи (ULID)
+        status:
+          type: string
+          description: >-
+            Состояние записи: pending — операция записи выполняется, confirmed — запись
+            подтверждена, completed — приём состоялся, cancelled — запись отменена
+        scheduled_at:
+          type: string
+          description: Время начала приёма с учётом часового пояса клиники (ISO 8601)
+        duration_minutes:
+          type: integer
+          description: Плановая длительность приёма в минутах
+        service_name:
+          type: string
+          description: Наименование услуги
+        doctor_name:
+          type: string
+          description: ФИО врача
+        specialty:
+          type: string
+          description: Специальность врача
+        clinic_name:
+          type: string
+          description: Подразделение, в котором состоится приём
+        price:
+          type: integer
+          description: Стоимость услуги в копейках, 0 — услуга покрыта полисом ДМС
+        payment_status:
+          type: string
+          description: >-
+            Статус оплаты: not_required — оплата не требуется, authorized — средства
+            заблокированы, paid — оплачено, refunded — средства возвращены
+        lab_reservation_at:
+          type: string
+          nullable: true
+          description: Зарезервированное время забора биоматериала, null — исследование не требуется
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Машиночитаемый код ошибки
+        message:
+          type: string
+          description: Описание ошибки для показа пользователю
+        trace_id:
+          type: string
+          description: Идентификатор трассировки для разбора инцидента службой поддержки
